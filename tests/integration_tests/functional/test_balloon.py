@@ -9,12 +9,13 @@ import subprocess
 import time
 
 import pytest
+from retry import retry
 
 from conftest import _test_images_s3_bucket
 from framework.artifacts import ArtifactCollection, ArtifactSet
 from framework.builder import MicrovmBuilder, SnapshotBuilder, SnapshotType
 from framework.matrix import TestMatrix, TestContext
-from framework.utils import get_free_mem_ssh
+from framework.utils import get_free_mem_ssh, run_cmd
 
 import host_tools.network as net_tools  # pylint: disable=import-error
 
@@ -22,10 +23,27 @@ import host_tools.network as net_tools  # pylint: disable=import-error
 MB_TO_PAGES = 256
 
 
-def get_rss_mem_by_pid(pid):
-    """Get the RSS memory that a guest uses, given the pid of the guest."""
-    output = subprocess.check_output("pmap -X {}".format(pid), shell=True)
-    return int(output.decode('utf-8').split('\n')[-2].split()[1], 10)
+@retry(delay=0.5, tries=10)
+def get_stable_rss_mem_by_pid(pid, percentage_delta=0.5):
+    """
+    Get the RSS memory that a guest uses, given the pid of the guest.
+
+    Wait till the fluctuations in RSS drop below percentage_delta. If timeout
+    is reached before the fluctuations drop, raise an exception.
+    """
+
+    def get_rss_from_pmap():
+        _, output, _ = run_cmd("pmap -X {}".format(pid))
+        return int(output.split('\n')[-2].split()[1], 10)
+
+    first_rss = get_rss_from_pmap()
+    time.sleep(1)
+    second_rss = get_rss_from_pmap()
+
+    delta = (abs(first_rss - second_rss)/float(first_rss)) * 100
+    assert delta < percentage_delta
+
+    return second_rss
 
 
 def make_guest_dirty_memory(ssh_connection, should_oom=False, amount=8192):
@@ -85,13 +103,19 @@ def build_test_matrix(network_config, bin_cloner_path, logger):
     )
 
 
-def copy_fillmem_to_rootfs(rootfs_path):
+def copy_util_to_rootfs(rootfs_path, util):
     """Build and copy the 'memfill' program to the rootfs."""
-    subprocess.check_call("gcc ./host_tools/fillmem.c -o fillmem", shell=True)
+    subprocess.check_call(
+        "gcc ./host_tools/{util}.c -o {util}".format(util=util),
+        shell=True
+    )
     subprocess.check_call("mkdir tmpfs", shell=True)
     subprocess.check_call("mount {} tmpfs".format(rootfs_path), shell=True)
-    subprocess.check_call("cp fillmem tmpfs/sbin/fillmem", shell=True)
-    subprocess.check_call("rm fillmem", shell=True)
+    subprocess.check_call(
+        "cp {util} tmpfs/sbin/{util}".format(util=util),
+        shell=True
+    )
+    subprocess.check_call("rm {}".format(util), shell=True)
     subprocess.check_call("umount tmpfs", shell=True)
     subprocess.check_call("rmdir tmpfs", shell=True)
 
@@ -112,7 +136,6 @@ def test_rss_memory_lower(test_microvm_with_ssh_and_balloon, network_config):
     response = test_microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=True,
-        must_tell_host=False,
         stats_polling_interval_s=0
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -127,15 +150,15 @@ def test_rss_memory_lower(test_microvm_with_ssh_and_balloon, network_config):
     # Using deflate_on_oom, get the RSS as low as possible
     response = test_microvm.balloon.patch(amount_mb=200)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
 
     # Get initial rss consumption.
-    init_rss = get_rss_mem_by_pid(firecracker_pid)
+    init_rss = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Get the balloon back to 0.
     response = test_microvm.balloon.patch(amount_mb=0)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(2)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Dirty memory, then inflate balloon and get ballooned rss consumption.
     make_guest_dirty_memory(ssh_connection)
@@ -143,8 +166,7 @@ def test_rss_memory_lower(test_microvm_with_ssh_and_balloon, network_config):
     response = test_microvm.balloon.patch(amount_mb=200)
 
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
-    balloon_rss = get_rss_mem_by_pid(firecracker_pid)
+    balloon_rss = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Check that the ballooning reclaimed the memory.
     assert balloon_rss - init_rss <= 15000
@@ -167,7 +189,6 @@ def test_inflate_reduces_free(test_microvm_with_ssh_and_balloon,
     response = test_microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=False,
-        must_tell_host=False,
         stats_polling_interval_s=1
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -176,6 +197,7 @@ def test_inflate_reduces_free(test_microvm_with_ssh_and_balloon,
     test_microvm.start()
 
     # Get and open an ssh connection.
+    firecracker_pid = test_microvm.jailer_clone_pid
     ssh_connection = net_tools.SSHConnection(test_microvm.ssh_config)
 
     # Get the free memory before ballooning.
@@ -184,7 +206,8 @@ def test_inflate_reduces_free(test_microvm_with_ssh_and_balloon,
     # Inflate 64 MB == 16384 page balloon.
     response = test_microvm.balloon.patch(amount_mb=64)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Get the free memory after ballooning.
     available_mem_inflated = get_free_mem_ssh(ssh_connection)
@@ -210,7 +233,6 @@ def test_deflate_on_oom_true(test_microvm_with_ssh_and_balloon,
     response = test_microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=True,
-        must_tell_host=False,
         stats_polling_interval_s=0
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -219,12 +241,14 @@ def test_deflate_on_oom_true(test_microvm_with_ssh_and_balloon,
     test_microvm.start()
 
     # Get an ssh connection to the microvm.
+    firecracker_pid = test_microvm.jailer_clone_pid
     ssh_connection = net_tools.SSHConnection(test_microvm.ssh_config)
 
     # Inflate the balloon
     response = test_microvm.balloon.patch(amount_mb=172)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Check that using memory doesn't lead to an out of memory error.
     # Note that due to `test_deflate_on_oom_false`, we know that
@@ -250,7 +274,6 @@ def test_deflate_on_oom_false(test_microvm_with_ssh_and_balloon,
     response = test_microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=False,
-        must_tell_host=False,
         stats_polling_interval_s=0
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -259,12 +282,14 @@ def test_deflate_on_oom_false(test_microvm_with_ssh_and_balloon,
     test_microvm.start()
 
     # Get an ssh connection to the microvm.
+    firecracker_pid = test_microvm.jailer_clone_pid
     ssh_connection = net_tools.SSHConnection(test_microvm.ssh_config)
 
     # Inflate the balloon.
     response = test_microvm.balloon.patch(amount_mb=172)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Check that using memory does lead to an out of memory error.
     make_guest_dirty_memory(ssh_connection, should_oom=True)
@@ -286,7 +311,6 @@ def test_reinflate_balloon(test_microvm_with_ssh_and_balloon, network_config):
     response = test_microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=True,
-        must_tell_host=False,
         stats_polling_interval_s=0
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -298,30 +322,42 @@ def test_reinflate_balloon(test_microvm_with_ssh_and_balloon, network_config):
     firecracker_pid = test_microvm.jailer_clone_pid
     ssh_connection = net_tools.SSHConnection(test_microvm.ssh_config)
 
+    # First inflate the balloon to free up the uncertain amount of memory
+    # used by the kernel at boot and establish a baseline, then give back
+    # the memory.
+    response = test_microvm.balloon.patch(amount_mb=200)
+    assert test_microvm.api_session.is_status_no_content(response.status_code)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
+
+    response = test_microvm.balloon.patch(amount_mb=0)
+    assert test_microvm.api_session.is_status_no_content(response.status_code)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
+
     # Get the guest to dirty memory.
     make_guest_dirty_memory(ssh_connection)
-    first_reading = get_rss_mem_by_pid(firecracker_pid)
+    first_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Now inflate the balloon.
     response = test_microvm.balloon.patch(amount_mb=200)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
-    second_reading = get_rss_mem_by_pid(firecracker_pid)
+    second_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
-    # Now inflate the balloon again.
+    # Now deflate the balloon.
     response = test_microvm.balloon.patch(amount_mb=0)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(2)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Now have the guest dirty memory again.
     make_guest_dirty_memory(ssh_connection)
-    third_reading = get_rss_mem_by_pid(firecracker_pid)
+    third_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Now inflate the balloon again.
     response = test_microvm.balloon.patch(amount_mb=200)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
-    fourth_reading = get_rss_mem_by_pid(firecracker_pid)
+    fourth_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Check that the memory used is the same after regardless of the previous
     # inflate history of the balloon (with the third reading being allowed
@@ -347,7 +383,6 @@ def test_size_reduction(test_microvm_with_ssh_and_balloon, network_config):
     response = test_microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=True,
-        must_tell_host=False,
         stats_polling_interval_s=0
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -360,7 +395,7 @@ def test_size_reduction(test_microvm_with_ssh_and_balloon, network_config):
     ssh_connection = net_tools.SSHConnection(test_microvm.ssh_config)
 
     # Check memory usage.
-    first_reading = get_rss_mem_by_pid(firecracker_pid)
+    first_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Have the guest drop its caches.
     ssh_connection.execute_command('sync; echo 3 > /proc/sys/vm/drop_caches')
@@ -369,10 +404,9 @@ def test_size_reduction(test_microvm_with_ssh_and_balloon, network_config):
     # Now inflate the balloon.
     response = test_microvm.balloon.patch(amount_mb=40)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
 
     # Check memory usage again.
-    second_reading = get_rss_mem_by_pid(firecracker_pid)
+    second_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # There should be a reduction of at least 10MB.
     assert first_reading - second_reading >= 10000
@@ -394,7 +428,6 @@ def test_stats(test_microvm_with_ssh_and_balloon, network_config):
     response = test_microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=True,
-        must_tell_host=False,
         stats_polling_interval_s=1
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -403,6 +436,7 @@ def test_stats(test_microvm_with_ssh_and_balloon, network_config):
     test_microvm.start()
 
     # Open an ssh connection to the microvm.
+    firecracker_pid = test_microvm.jailer_clone_pid
     ssh_connection = net_tools.SSHConnection(test_microvm.ssh_config)
 
     # Get an initial reading of the stats.
@@ -411,6 +445,8 @@ def test_stats(test_microvm_with_ssh_and_balloon, network_config):
     # Dirty 10MB of pages.
     make_guest_dirty_memory(ssh_connection, amount=(10 * MB_TO_PAGES))
     time.sleep(1)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Make sure that the stats catch the page faults.
     after_workload_stats = test_microvm.balloon.get_stats().json()
@@ -420,7 +456,8 @@ def test_stats(test_microvm_with_ssh_and_balloon, network_config):
     # Now inflate the balloon with 10MB of pages.
     response = test_microvm.balloon.patch(amount_mb=10)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(1)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Get another reading of the stats after the polling interval has passed.
     inflated_stats = test_microvm.balloon.get_stats().json()
@@ -439,7 +476,8 @@ def test_stats(test_microvm_with_ssh_and_balloon, network_config):
     # available memory.
     response = test_microvm.balloon.patch(amount_mb=0)
     assert test_microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(1)
+    # This call will internally wait for rss to become stable.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Get another reading of the stats after the polling interval has passed.
     deflated_stats = test_microvm.balloon.get_stats().json()
@@ -495,13 +533,12 @@ def _test_balloon_snapshot(context):
                               config=context.microvm,
                               enable_diff_snapshots=enable_diff_snapshots)
 
-    copy_fillmem_to_rootfs(root_disk.local_path())
+    copy_util_to_rootfs(root_disk.local_path(), 'fillmem')
 
     # Add a memory balloon with stats enabled.
     response = basevm.balloon.put(
         amount_mb=0,
         deflate_on_oom=True,
-        must_tell_host=False,
         stats_polling_interval_s=1
     )
     assert basevm.api_session.is_status_no_content(response.status_code)
@@ -517,15 +554,14 @@ def _test_balloon_snapshot(context):
     firecracker_pid = basevm.jailer_clone_pid
 
     # Check memory usage.
-    first_reading = get_rss_mem_by_pid(firecracker_pid)
+    first_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Now inflate the balloon with 20MB of pages.
     response = basevm.balloon.patch(amount_mb=20)
     assert basevm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
 
     # Check memory usage again.
-    second_reading = get_rss_mem_by_pid(firecracker_pid)
+    second_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # There should be a reduction in RSS, but it's inconsistent.
     # We only test that the reduction happens.
@@ -554,23 +590,21 @@ def _test_balloon_snapshot(context):
     firecracker_pid = microvm.jailer_clone_pid
 
     # Check memory usage.
-    third_reading = get_rss_mem_by_pid(firecracker_pid)
+    third_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # Dirty 60MB of pages.
     make_guest_dirty_memory(ssh_connection, amount=(60 * MB_TO_PAGES))
-    time.sleep(1)
 
     # Check memory usage.
-    fourth_reading = get_rss_mem_by_pid(firecracker_pid)
+    fourth_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     assert fourth_reading > third_reading
 
     # Inflate the balloon with another 20MB of pages.
     response = microvm.balloon.patch(amount_mb=40)
     assert microvm.api_session.is_status_no_content(response.status_code)
-    time.sleep(5)
 
-    fifth_reading = get_rss_mem_by_pid(firecracker_pid)
+    fifth_reading = get_stable_rss_mem_by_pid(firecracker_pid)
 
     # There should be a reduction in RSS, but it's inconsistent.
     # We only test that the reduction happens.
@@ -625,7 +659,6 @@ def _test_snapshot_compatibility(context):
     response = microvm.balloon.put(
         amount_mb=0,
         deflate_on_oom=True,
-        must_tell_host=False,
         stats_polling_interval_s=1
     )
     assert microvm.api_session.is_status_no_content(response.status_code)
@@ -639,7 +672,7 @@ def _test_snapshot_compatibility(context):
     assert microvm.api_session.is_status_no_content(response.status_code)
 
     # Try to create a snapshot with a balloon on version 0.23.0.
-    response = microvm.snapshot_create.put(
+    response = microvm.snapshot.create(
         mem_file_path='memfile',
         snapshot_path='dummy',
         diff=False,
@@ -662,5 +695,76 @@ def _test_snapshot_compatibility(context):
         ssh_key,
         snapshot_type
     )
+
+    microvm.kill()
+
+
+def test_memory_scrub(
+    network_config,
+    bin_cloner_path
+):
+    """Test that the memory is zeroed after deflate."""
+    logger = logging.getLogger()
+
+    # Create the test matrix.
+    test_matrix = build_test_matrix(network_config, bin_cloner_path, logger)
+
+    test_matrix.run_test(_test_memory_scrub)
+
+
+def _test_memory_scrub(context):
+    vm_builder = context.custom['builder']
+
+    # Create a rw copy artifact.
+    root_disk = context.disk.copy()
+    # Get ssh key from read-only artifact.
+    ssh_key = context.disk.ssh_key()
+    # Create a fresh microvm from aftifacts.
+    microvm = vm_builder.build(
+        kernel=context.kernel,
+        disks=[root_disk],
+        ssh_key=ssh_key,
+        config=context.microvm
+    )
+
+    copy_util_to_rootfs(root_disk.local_path(), 'fillmem')
+    copy_util_to_rootfs(root_disk.local_path(), 'readmem')
+
+    # Add a memory balloon with stats enabled.
+    response = microvm.balloon.put(
+        amount_mb=0,
+        deflate_on_oom=True,
+        stats_polling_interval_s=1
+    )
+    assert microvm.api_session.is_status_no_content(response.status_code)
+
+    microvm.start()
+
+    ssh_connection = net_tools.SSHConnection(microvm.ssh_config)
+
+    # Dirty 60MB of pages.
+    make_guest_dirty_memory(ssh_connection, amount=(60 * MB_TO_PAGES))
+
+    # Now inflate the balloon with 60MB of pages.
+    response = microvm.balloon.patch(amount_mb=60)
+    assert microvm.api_session.is_status_no_content(response.status_code)
+
+    # Get the firecracker pid, and open an ssh connection.
+    firecracker_pid = microvm.jailer_clone_pid
+
+    # Wait for the inflate to complete.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
+
+    # Deflate the balloon completely.
+    response = microvm.balloon.patch(amount_mb=0)
+    assert microvm.api_session.is_status_no_content(response.status_code)
+
+    # Wait for the deflate to complete.
+    _ = get_stable_rss_mem_by_pid(firecracker_pid)
+
+    exit_code, _, _ = ssh_connection.execute_command(
+        "/sbin/readmem {} {}".format(60, 1)
+    )
+    assert exit_code == 0
 
     microvm.kill()

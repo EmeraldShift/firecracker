@@ -36,11 +36,11 @@ use vmm::Vmm;
 use crate::mock_devices::MockSerialInput;
 #[cfg(target_arch = "x86_64")]
 use crate::mock_resources::NOISY_KERNEL_IMAGE;
-use crate::mock_resources::{MockBootSourceConfig, MockVmResources};
+use crate::mock_resources::{MockBootSourceConfig, MockVmConfig, MockVmResources};
 use crate::mock_seccomp::MockSeccomp;
 use crate::test_utils::{restore_stdin, set_panic_hook};
 
-fn default_vmm(_kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+fn create_vmm(_kernel_image: Option<&str>, is_diff: bool) -> (Arc<Mutex<Vmm>>, EventManager) {
     let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
 
@@ -52,14 +52,28 @@ fn default_vmm(_kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
         Some(kernel) => boot_source_cfg.with_kernel(kernel).into(),
         None => boot_source_cfg.into(),
     };
-    let resources: VmResources = MockVmResources::new()
-        .with_boot_source(boot_source_cfg)
-        .into();
+    let mock_vm_res = MockVmResources::new().with_boot_source(boot_source_cfg);
+    let resources: VmResources = if is_diff {
+        mock_vm_res
+            .with_vm_config(MockVmConfig::new().with_dirty_page_tracking().into())
+            .into()
+    } else {
+        mock_vm_res.into()
+    };
 
     (
         build_microvm_for_boot(&resources, &mut event_manager, &empty_seccomp_filter).unwrap(),
         event_manager,
     )
+}
+
+fn default_vmm(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+    create_vmm(kernel_image, false)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dirty_tracking_vmm(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+    create_vmm(kernel_image, true)
 }
 
 fn wait_vmm_child_process(vmm_pid: i32) {
@@ -195,11 +209,11 @@ fn test_pause_resume_microvm() {
 
             // There's a race between this thread and the vcpu thread, but this thread
             // should be able to pause vcpu thread before it finishes running its test-binary.
-            assert!(vmm.lock().unwrap().pause_vcpus().is_ok());
+            assert!(vmm.lock().unwrap().pause_vm().is_ok());
             // Pausing again the microVM should not fail (microVM remains in the
             // `Paused` state).
-            assert!(vmm.lock().unwrap().pause_vcpus().is_ok());
-            assert!(vmm.lock().unwrap().resume_vcpus().is_ok());
+            assert!(vmm.lock().unwrap().pause_vm().is_ok());
+            assert!(vmm.lock().unwrap().resume_vm().is_ok());
 
             let _ = event_manager.run_with_timeout(500).unwrap();
 
@@ -258,10 +272,9 @@ fn test_dirty_bitmap_success() {
         0 => {
             set_panic_hook();
 
-            // The vmm will start with dirty page tracking = OFF.
-            let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));
+            // The vmm will start with dirty page tracking = ON.
+            let (vmm, _) = dirty_tracking_vmm(Some(NOISY_KERNEL_IMAGE));
 
-            assert!(vmm.lock().unwrap().set_dirty_page_tracking(true).is_ok());
             // Let it churn for a while and dirty some pages...
             thread::sleep(Duration::from_millis(100));
             let bitmap = vmm.lock().unwrap().get_dirty_bitmap().unwrap();
@@ -301,7 +314,7 @@ fn test_disallow_snapshots_without_pausing() {
             };
 
             // Pause microVM.
-            vmm.lock().unwrap().pause_vcpus().unwrap();
+            vmm.lock().unwrap().pause_vm().unwrap();
             // It is now allowed.
             vmm.lock().unwrap().save_state().unwrap();
             // Stop.
@@ -324,19 +337,18 @@ fn verify_create_snapshot(is_diff: bool) -> (TempFile, TempFile) {
         0 => {
             set_panic_hook();
 
-            let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));
-            assert!(vmm.lock().unwrap().set_dirty_page_tracking(true).is_ok());
+            let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), is_diff);
 
             // Be sure that the microVM is running.
             thread::sleep(Duration::from_millis(200));
 
             // Pause microVM.
-            vmm.lock().unwrap().pause_vcpus().unwrap();
+            vmm.lock().unwrap().pause_vm().unwrap();
 
             // Create snapshot.
             let snapshot_type = match is_diff {
+                true => SnapshotType::Diff,
                 false => SnapshotType::Full,
-                true => unimplemented!(),
             };
             let snapshot_params = CreateSnapshotParams {
                 snapshot_type,
@@ -408,8 +420,9 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
                 VERSION_MAP.clone(),
             )
             .unwrap();
-            let mem = GuestMemoryMmap::restore(memory_file.as_file(), &microvm_state.memory_state)
-                .unwrap();
+            let mem =
+                GuestMemoryMmap::restore(memory_file.as_file(), &microvm_state.memory_state, false)
+                    .unwrap();
 
             // Build microVM from state.
             let vmm = build_microvm_from_snapshot(
@@ -433,6 +446,14 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_create_and_load_snapshot() {
+    // Create diff snapshot.
+    let (snapshot_file, memory_file) = verify_create_snapshot(true);
+    // Create a new microVm from snapshot. This only tests code-level logic; it verifies
+    // that a microVM can be built with no errors from given snapshot.
+    // It does _not_ verify that the guest is actually restored properly. We're using
+    // python integration tests for that.
+    verify_load_snapshot(snapshot_file, memory_file);
+
     // Create full snapshot.
     let (snapshot_file, memory_file) = verify_create_snapshot(false);
     // Create a new microVm from snapshot. This only tests code-level logic; it verifies
@@ -440,4 +461,108 @@ fn test_create_and_load_snapshot() {
     // It does _not_ verify that the guest is actually restored properly. We're using
     // python integration tests for that.
     verify_load_snapshot(snapshot_file, memory_file);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_snapshot_cpu_vendor() {
+    use vmm::persist::validate_x86_64_cpu_vendor;
+    // Create a diff snapshot.
+    let (snapshot_file, _) = verify_create_snapshot(true);
+
+    // Deserialize the microVM state.
+    let snapshot_file_metadata = snapshot_file.as_file().metadata().unwrap();
+    let snapshot_len = snapshot_file_metadata.len() as usize;
+    snapshot_file.as_file().seek(SeekFrom::Start(0)).unwrap();
+    let microvm_state: MicrovmState = Snapshot::load(
+        &mut snapshot_file.as_file(),
+        snapshot_len,
+        VERSION_MAP.clone(),
+    )
+    .unwrap();
+
+    // Check if the snapshot created above passes validation since
+    // the snapshot was created locally.
+    assert!(validate_x86_64_cpu_vendor(&microvm_state).is_ok());
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_snapshot_cpu_vendor_mismatch() {
+    use vmm::persist::validate_x86_64_cpu_vendor;
+    // Create a diff snapshot.
+    let (snapshot_file, _) = verify_create_snapshot(true);
+
+    // Deserialize the microVM state.
+    let snapshot_file_metadata = snapshot_file.as_file().metadata().unwrap();
+    let snapshot_len = snapshot_file_metadata.len() as usize;
+    snapshot_file.as_file().seek(SeekFrom::Start(0)).unwrap();
+    let mut microvm_state: MicrovmState = Snapshot::load(
+        &mut snapshot_file.as_file(),
+        snapshot_len,
+        VERSION_MAP.clone(),
+    )
+    .unwrap();
+
+    // Check if the snapshot created above passes validation since
+    // the snapshot was created locally.
+    assert!(validate_x86_64_cpu_vendor(&microvm_state).is_ok());
+
+    // Modify the vendor id in CPUID.
+    for entry in microvm_state.vcpu_states[0].cpuid.as_mut_slice().iter_mut() {
+        if entry.function == 0 && entry.index == 0 {
+            // Fail if vendor id is NULL as this needs furhter investigation.
+            assert_ne!(entry.ebx, 0);
+            assert_ne!(entry.ecx, 0);
+            assert_ne!(entry.edx, 0);
+            entry.ebx = 0;
+            break;
+        }
+    }
+
+    // This must fail as the cpu vendor has been mangled.
+    assert!(validate_x86_64_cpu_vendor(&microvm_state).is_err());
+
+    // Negative test: remove the vendor id from cpuid.
+    for entry in microvm_state.vcpu_states[0].cpuid.as_mut_slice().iter_mut() {
+        if entry.function == 0 && entry.index == 0 {
+            entry.function = 1234;
+        }
+    }
+
+    // This must fail as the cpu vendor has been mangled.
+    assert!(validate_x86_64_cpu_vendor(&microvm_state).is_err());
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_snapshot_cpu_vendor_missing() {
+    use vmm::persist::validate_x86_64_cpu_vendor;
+    // Create a diff snapshot.
+    let (snapshot_file, _) = verify_create_snapshot(true);
+
+    // Deserialize the microVM state.
+    let snapshot_file_metadata = snapshot_file.as_file().metadata().unwrap();
+    let snapshot_len = snapshot_file_metadata.len() as usize;
+    snapshot_file.as_file().seek(SeekFrom::Start(0)).unwrap();
+    let mut microvm_state: MicrovmState = Snapshot::load(
+        &mut snapshot_file.as_file(),
+        snapshot_len,
+        VERSION_MAP.clone(),
+    )
+    .unwrap();
+
+    // Check if the snapshot created above passes validation since
+    // the snapshot was created locally.
+    assert!(validate_x86_64_cpu_vendor(&microvm_state).is_ok());
+
+    // Negative test: remove the vendor id from cpuid.
+    for entry in microvm_state.vcpu_states[0].cpuid.as_mut_slice().iter_mut() {
+        if entry.function == 0 && entry.index == 0 {
+            entry.function = 1234;
+        }
+    }
+
+    // This must fail as the cpu vendor entry does not exist.
+    assert!(validate_x86_64_cpu_vendor(&microvm_state).is_err());
 }

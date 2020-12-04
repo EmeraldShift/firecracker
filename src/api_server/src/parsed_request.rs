@@ -26,7 +26,7 @@ use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 use logger::{error, info};
 use vmm::rpc_interface::{VmmAction, VmmActionError};
 
-pub enum ParsedRequest {
+pub(crate) enum ParsedRequest {
     GetInstanceInfo,
     GetMMDS,
     PatchMMDS(Value),
@@ -35,7 +35,7 @@ pub enum ParsedRequest {
 }
 
 impl ParsedRequest {
-    pub fn try_from_request(request: &Request) -> Result<ParsedRequest, Error> {
+    pub(crate) fn try_from_request(request: &Request) -> Result<ParsedRequest, Error> {
         let request_uri = request.uri().get_abs_path().to_string();
         log_received_api_request(describe(
             request.method(),
@@ -92,7 +92,7 @@ impl ParsedRequest {
         }
     }
 
-    pub fn convert_to_response(
+    pub(crate) fn convert_to_response(
         request_outcome: &std::result::Result<VmmData, VmmActionError>,
     ) -> Response {
         match request_outcome {
@@ -135,7 +135,7 @@ impl ParsedRequest {
     }
 
     /// Helper function to avoid boiler-plate code.
-    pub fn new_sync(vmm_action: VmmAction) -> ParsedRequest {
+    pub(crate) fn new_sync(vmm_action: VmmAction) -> ParsedRequest {
         ParsedRequest::Sync(Box::new(vmm_action))
     }
 }
@@ -170,7 +170,7 @@ fn describe(method: Method, path: &str, body: Option<&Body>) -> String {
 }
 
 /// Generates a `GenericError` for each request method.
-pub fn method_to_error(method: Method) -> Result<ParsedRequest, Error> {
+pub(crate) fn method_to_error(method: Method) -> Result<ParsedRequest, Error> {
     match method {
         Method::Get => Err(Error::Generic(
             StatusCode::BadRequest,
@@ -188,7 +188,7 @@ pub fn method_to_error(method: Method) -> Result<ParsedRequest, Error> {
 }
 
 #[derive(Debug)]
-pub enum Error {
+pub(crate) enum Error {
     // A generic error, with a given status code and message to be turned into a fault message.
     Generic(StatusCode, String),
     // The resource ID is empty.
@@ -240,7 +240,7 @@ impl Into<Response> for Error {
 }
 
 // This function is supposed to do id validation for requests.
-pub fn checked_id(id: &str) -> Result<&str, Error> {
+pub(crate) fn checked_id(id: &str) -> Result<&str, Error> {
     // todo: are there any checks we want to do on id's?
     // not allow them to be empty strings maybe?
     // check: ensure string is not empty
@@ -652,9 +652,8 @@ pub(crate) mod tests {
             .write_all(
                 b"PUT /balloon HTTP/1.1\r\n\
                 Content-Type: application/json\r\n\
-                Content-Length: 99\r\n\r\n{ \
+                Content-Length: 74\r\n\r\n{ \
                 \"amount_mb\": 0, \
-                \"must_tell_host\": false, \
                 \"deflate_on_oom\": false, \
                 \"stats_polling_interval_s\": 0 \
                 }",
@@ -746,12 +745,11 @@ pub(crate) mod tests {
             .write_all(
                 b"PUT /machine-config HTTP/1.1\r\n\
                 Content-Type: application/json\r\n\
-                Content-Length: 80\r\n\r\n{ \
-                \"vcpu_count\": 0, \
-                \"mem_size_mib\": 0, \
-                \"ht_enabled\": true, \
-                \"cpu_template\": \"C3\" \
-            }",
+                Content-Length: 58\r\n\r\n{ \
+                    \"vcpu_count\": 0, \
+                    \"mem_size_mib\": 0, \
+                    \"ht_enabled\": true \
+                }",
             )
             .unwrap();
         assert!(connection.try_read().is_ok());
@@ -981,6 +979,21 @@ pub(crate) mod tests {
             .write_all(
                 b"PATCH /machine-config HTTP/1.1\r\n\
                 Content-Type: application/json\r\n\
+                Content-Length: 58\r\n\r\n{ \
+                \"vcpu_count\": 0, \
+                \"mem_size_mib\": 0, \
+                \"ht_enabled\": true \
+            }",
+            )
+            .unwrap();
+        assert!(connection.try_read().is_ok());
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(ParsedRequest::try_from_request(&req).is_ok());
+
+        sender
+            .write_all(
+                b"PATCH /machine-config HTTP/1.1\r\n\
+                Content-Type: application/json\r\n\
                 Content-Length: 80\r\n\r\n{ \
                 \"vcpu_count\": 0, \
                 \"mem_size_mib\": 0, \
@@ -991,7 +1004,10 @@ pub(crate) mod tests {
             .unwrap();
         assert!(connection.try_read().is_ok());
         let req = connection.pop_parsed_request().unwrap();
+        #[cfg(target_arch = "x86_64")]
         assert!(ParsedRequest::try_from_request(&req).is_ok());
+        #[cfg(target_arch = "aarch64")]
+        assert!(ParsedRequest::try_from_request(&req).is_err());
     }
 
     #[test]

@@ -138,7 +138,7 @@ class MicrovmBuilder:
         # Hardlink all the snapshot files into the microvm jail.
         jailed_mem = vm.create_jailed_resource(snapshot.mem)
         jailed_vmstate = vm.create_jailed_resource(snapshot.vmstate)
-        assert len(snapshot.disks) > 0, "Snapshot requiures at least one disk."
+        assert len(snapshot.disks) > 0, "Snapshot requires at least one disk."
         _jailed_disks = []
         for disk in snapshot.disks:
             _jailed_disks.append(vm.create_jailed_resource(disk))
@@ -149,22 +149,23 @@ class MicrovmBuilder:
                                      netmask_len=DEFAULT_NETMASK,
                                      tapname=DEFAULT_TAP_NAME)
 
-        response = vm.snapshot_load.put(mem_file_path=jailed_mem,
-                                        snapshot_path=jailed_vmstate,
-                                        diff=enable_diff_snapshots)
+        response = vm.snapshot.load(mem_file_path=jailed_mem,
+                                    snapshot_path=jailed_vmstate,
+                                    diff=enable_diff_snapshots,
+                                    resume=resume)
 
         assert vm.api_session.is_status_no_content(response.status_code)
-
-        if resume:
-            # Resume microvm
-            response = vm.vm.patch(state='Resumed')
-            assert vm.api_session.is_status_no_content(response.status_code)
 
         # Reset root path so next microvm is built some place else.
         self.init_root_path()
 
         # Return a resumed microvm.
         return vm, metrics_fifo
+
+    def create_basevm(self):
+        """Create a clean VM in an initial state."""
+        return init_microvm(self.root_path, self.bin_cloner_path,
+                            self._fc_binary, self._jailer_binary)
 
 
 class SnapshotBuilder:  # pylint: disable=too-few-public-methods
@@ -174,15 +175,8 @@ class SnapshotBuilder:  # pylint: disable=too-few-public-methods
         """Initialize the snapshot builder."""
         self._microvm = microvm
 
-    def create(self,
-               disks,
-               ssh_key: Artifact,
-               snapshot_type: SnapshotType = SnapshotType.FULL,
-               target_version: str = None):
-        """Create a Snapshot object from a microvm and artifacts."""
-        # Disable API timeout as the APIs for snapshot related procedures
-        # take longer.
-        self._microvm.api_session.untime()
+    def create_snapshot_dir(self):
+        """Create dir and files for saving snapshot state and memory."""
         chroot_path = self._microvm.jailer.chroot_path()
         snapshot_dir = os.path.join(chroot_path, "snapshot")
         Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
@@ -190,16 +184,30 @@ class SnapshotBuilder:  # pylint: disable=too-few-public-methods
                                       self._microvm.jailer.gid,
                                       snapshot_dir)
         utils.run_cmd(cmd)
+        return snapshot_dir
+
+    def create(self,
+               disks,
+               ssh_key: Artifact,
+               snapshot_type: SnapshotType = SnapshotType.FULL,
+               target_version: str = None,
+               mem_file_name: str = "vm.mem",
+               snapshot_name: str = "vm.vmstate"):
+        """Create a Snapshot object from a microvm and artifacts."""
+        # Disable API timeout as the APIs for snapshot related procedures
+        # take longer.
+        self._microvm.api_session.untime()
+        snapshot_dir = self.create_snapshot_dir()
         self._microvm.pause_to_snapshot(
-            mem_file_path="/snapshot/vm.mem",
-            snapshot_path="/snapshot/vm.vmstate",
+            mem_file_path="/snapshot/"+mem_file_name,
+            snapshot_path="/snapshot/"+snapshot_name,
             diff=snapshot_type == SnapshotType.DIFF,
             version=target_version)
 
         # Create a copy of the ssh_key artifact.
         ssh_key_copy = ssh_key.copy()
-        mem_path = os.path.join(snapshot_dir, "vm.mem")
-        vmstate_path = os.path.join(snapshot_dir, "vm.vmstate")
+        mem_path = os.path.join(snapshot_dir, mem_file_name)
+        vmstate_path = os.path.join(snapshot_dir, snapshot_name)
         return Snapshot(mem=mem_path,
                         vmstate=vmstate_path,
                         # TODO: To support more disks we need to figure out a

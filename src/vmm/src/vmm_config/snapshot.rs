@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 /// creating a new snapshot.
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub enum SnapshotType {
+    /// Diff snapshot.
+    Diff,
     /// Full snapshot.
     Full,
 }
@@ -50,6 +52,10 @@ pub struct LoadSnapshotParams {
     /// allow taking subsequent incremental snapshots.
     #[serde(default)]
     pub enable_diff_snapshots: bool,
+    /// When set to true, the vm is also resumed if the snapshot load
+    /// is successful.
+    #[serde(default)]
+    pub resume_vm: bool,
 }
 
 /// The microVM state options.

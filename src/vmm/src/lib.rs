@@ -55,9 +55,9 @@ use crate::vstate::{
 use arch::DeviceType;
 use devices::virtio::balloon::Error as BalloonError;
 use devices::virtio::{
-    Balloon, BalloonConfig, BalloonStats, MmioTransport, BALLOON_DEV_ID, TYPE_BALLOON,
+    Balloon, BalloonConfig, BalloonStats, Block, MmioTransport, Net, BALLOON_DEV_ID, TYPE_BALLOON,
+    TYPE_BLOCK, TYPE_NET,
 };
-use devices::virtio::{Block, Net, TYPE_BLOCK, TYPE_NET};
 use devices::BusDevice;
 use logger::{error, info, warn, LoggerError, MetricsError, METRICS};
 use polly::event_manager::{EventManager, Subscriber};
@@ -220,6 +220,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Shorthand type for KVM dirty page bitmap.
 pub type DirtyBitmap = HashMap<usize, Vec<u64>>;
 
+/// Returns the size of guest memory, in MiB.
+pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
+    guest_memory.map_and_fold(0, |(_, region)| region.len(), |a, b| a + b) >> 20
+}
+
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
     events_observer: Option<Box<dyn VmmEventsObserver>>,
@@ -296,13 +301,14 @@ impl Vmm {
     }
 
     /// Sends a resume command to the vCPUs.
-    pub fn resume_vcpus(&mut self) -> Result<()> {
+    pub fn resume_vm(&mut self) -> Result<()> {
+        self.mmio_device_manager.kick_devices();
         self.broadcast_vcpu_event(VcpuEvent::Resume, VcpuResponse::Resumed)
             .map_err(|_| Error::VcpuResume)
     }
 
     /// Sends a pause command to the vCPUs.
-    pub fn pause_vcpus(&mut self) -> Result<()> {
+    pub fn pause_vm(&mut self) -> Result<()> {
         self.broadcast_vcpu_event(VcpuEvent::Pause, VcpuResponse::Paused)
             .map_err(|_| Error::VcpuPause)
     }
@@ -363,7 +369,7 @@ impl Vmm {
 
         let device_states = self.mmio_device_manager.save();
 
-        let mem_size_mib = persist::mem_size_mib(self.guest_memory());
+        let mem_size_mib = mem_size_mib(self.guest_memory());
         let memory_state = self.guest_memory().describe();
 
         Ok(MicrovmState {
@@ -457,13 +463,7 @@ impl Vmm {
         for response in vcpu_responses.into_iter() {
             match response {
                 VcpuResponse::RestoredState => (),
-                VcpuResponse::Error(e) => {
-                    error!("Fatal error: {}", e);
-                    // Stop all vCPUs and exit.
-                    let _ = self.exit_vcpus();
-                    self.stop(i32::from(FC_EXIT_CODE_BAD_CONFIGURATION));
-                    unreachable!()
-                }
+                VcpuResponse::Error(e) => return Err(MicrovmStateError::RestoreVcpuState(e)),
                 VcpuResponse::NotAllowed(reason) => {
                     return Err(MicrovmStateError::NotAllowed(reason))
                 }
@@ -511,6 +511,21 @@ impl Vmm {
                 block
                     .update_disk_image(path_on_host)
                     .map_err(|e| e.to_string())
+            })
+            .map_err(Error::DeviceManager)
+    }
+
+    /// Updates the rate limiter parameters for block device with `drive_id` id.
+    pub fn update_block_rate_limiter(
+        &mut self,
+        drive_id: &str,
+        rl_bytes: BucketUpdate,
+        rl_ops: BucketUpdate,
+    ) -> Result<()> {
+        self.mmio_device_manager
+            .with_virtio_device_with_id(TYPE_BLOCK, drive_id, |block: &mut Block| {
+                block.update_rate_limiter(rl_bytes, rl_ops);
+                Ok(())
             })
             .map_err(Error::DeviceManager)
     }
@@ -593,6 +608,12 @@ impl Vmm {
         &mut self,
         amount_mb: u32,
     ) -> std::result::Result<(), BalloonError> {
+        // The balloon cannot have a target size greater than the size of
+        // the guest memory.
+        if amount_mb as u64 > mem_size_mib(self.guest_memory()) {
+            return Err(BalloonError::TooManyPagesRequested);
+        }
+
         if let Some(busdev) = self.get_bus_device(DeviceType::Virtio(TYPE_BALLOON), BALLOON_DEV_ID)
         {
             {
@@ -652,6 +673,12 @@ impl Vmm {
         } else {
             Err(BalloonError::DeviceNotFound)
         }
+    }
+}
+
+impl Drop for Vmm {
+    fn drop(&mut self) {
+        let _ = self.exit_vcpus();
     }
 }
 

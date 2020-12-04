@@ -26,21 +26,14 @@ memory. Note that this applies to allocations from guest processes which would
 make the system enter an OOM state. This does not apply to instances when the
 kernel needs memory for its activities (i.e. constructing caches), or when the
 user requests more memory than the amount available through an inflate.
-* `must_tell_host`: if this is set to `true`, the kernel will wait for host
-confirmation before reclaiming memory from the host. This option is not useful
-in Firecracker's implementation of the balloon device because Firecracker does
-not perform any additional operations on returned pages, so it makes no
-difference if the guest waits for the host's approval on returned pages or not.
-Therefore, this option can be safely set to `false`.
 * `stats_polling_interval_s`: unsigned integer value which if set to 0
 disables the virtio balloon statistics and otherwise represents the interval
 of time in seconds at which the balloon statistics are updated.
 
 ## Security disclaimer
 
-> [!IMPORTANT]
-> The balloon device is a paravirtualized virtio device that requires cooperation
-from a driver in the guest.
+**The balloon device is a paravirtualized virtio device that requires cooperation
+from a driver in the guest.**
 
 In normal conditions, the balloon device will:
 * not change the target size, which is set directly by the host
@@ -61,11 +54,20 @@ memory usage, they can be broken by a compromised driver in the guest. The
 balloon device operates on a best effort model and users should always ensure
 the host is prepared to handle a situation in which the Firecracker process
 uses all of the memory it was given at boot even if the balloon was used to
-restrict the amount of memory available to the guest.
+restrict the amount of memory available to the guest. It is also the users'
+responsibility to monitor the memory consumption of the VM and, in case
+unexpected increases in memory usage are observed, we recommend the following
+options:
+* migrate the VM to a machine with higher memory availability through
+snapshotting at the cost of disrupting the workload;
+* kill the Firecracker process that exceeds memory restrictions;
+* enable swap with a sufficient amount of memory to handle the demand at the
+cost of memory access speed;
 
 Users should also never rely solely on the statistics provided by the balloon
 when controlling the Firecracker process as they are provided directly by the
-guest driver.
+guest driver and should always be viewed as an indication rather than a
+guarantee of what the memory state looks like in the guest.
 
 Please note that even in the case where the driver is not working properly,
 the balloon will never leak memory from one Firecracker process to another,
@@ -102,7 +104,6 @@ Here is an example command on how to install the balloon through the API:
 ```
 socket_location=...
 amount_mb=...
-must_tell_host=...
 deflate_on_oom=...
 polling_interval=...
 
@@ -112,7 +113,6 @@ curl --unix-socket $socket_location -i \
     -H 'Content-Type: application/json' \
     -d "{
         \"amount_mb\": $amount_mb, \
-        \"must_tell_host\": $must_tell_host, \
         \"deflate_on_oom\": $deflate_on_oom, \
         \"stats_polling_interval_s\": $polling_interval \
     }"
@@ -120,10 +120,9 @@ curl --unix-socket $socket_location -i \
 
 To use this, set `socket_location` to the location of the firecracker socket
 (by default, at `/run/firecracker.socket`. Then, set `amount_mb`,
-`must_tell_host`, `deflate_on_oom` and `stats_polling_interval_s` as
-desired: `num_pages` represents the target size of the balloon, and
-`must_tell_host`, `deflate_on_oom` and `stats_polling_interval_s`
-represent the options mentioned before.
+`deflate_on_oom` and `stats_polling_interval_s` as desired: `amount_mb`
+represents the target size of the balloon, and `deflate_on_oom` and
+`stats_polling_interval_s` represent the options mentioned before.
 
 To install the balloon via the JSON config file, insert the following JSON
 object into your configuration file:
@@ -131,7 +130,6 @@ object into your configuration file:
 ```
 "balloon": {
     "amount_mb": 0,
-    "must_tell_host": false,
     "deflate_on_oom": false,
     "stats_polling_interval_s": 1
 },

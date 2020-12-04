@@ -35,7 +35,6 @@ pub const DEFLATE_INDEX: usize = 1;
 pub const STATS_INDEX: usize = 2;
 
 // The feature bitmap for virtio balloon.
-const VIRTIO_BALLOON_F_MUST_TELL_HOST: u32 = 0; // Tell before reclaiming pages.
 const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1; // Enable statistics.
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2; // Deflate balloon on OOM.
 
@@ -71,6 +70,8 @@ pub enum Error {
     MalformedDescriptor,
     /// Guest gave us a malformed payload.
     MalformedPayload,
+    /// Error restoring the balloon device queues.
+    QueueRestoreError,
     /// Received stats querry when stats are disabled.
     StatisticsDisabled,
     /// Statistics cannot be enabled/disabled after activation.

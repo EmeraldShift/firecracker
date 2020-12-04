@@ -19,6 +19,7 @@ use utils::validators::validate_instance_id;
 use vmm::default_syscalls::get_seccomp_filter;
 use vmm::resources::VmResources;
 use vmm::signal_handler::register_signal_handlers;
+use vmm::version_map::FC_VERSION_TO_SNAP_VERSION;
 use vmm::vmm_config::instance_info::InstanceInfo;
 use vmm::vmm_config::logger::{init_logger, LoggerConfig, LoggerLevel};
 
@@ -136,6 +137,11 @@ fn main() {
             Argument::new("boot-timer")
                 .takes_value(false)
                 .help("Whether or not to load boot timer device for logging elapsed time since InstanceStart command.")
+        )
+        .arg(
+            Argument::new("version")
+                .takes_value(false)
+                .help("Print the binary version number and a list of supported snapshot data format versions.")
         );
 
     let arguments = match arg_parser.parse_from_cmdline() {
@@ -148,19 +154,16 @@ fn main() {
             process::exit(i32::from(vmm::FC_EXIT_CODE_ARG_PARSING));
         }
         _ => {
-            if let Some(help) = arg_parser.arguments().value_as_bool("help") {
-                if help {
-                    println!("Firecracker v{}\n", FIRECRACKER_VERSION);
-                    println!("{}", arg_parser.formatted_help());
-                    process::exit(i32::from(vmm::FC_EXIT_CODE_OK));
-                }
+            if arg_parser.arguments().flag_present("help") {
+                println!("Firecracker v{}\n", FIRECRACKER_VERSION);
+                println!("{}", arg_parser.formatted_help());
+                process::exit(i32::from(vmm::FC_EXIT_CODE_OK));
             }
 
-            if let Some(version) = arg_parser.arguments().value_as_bool("version") {
-                if version {
-                    println!("Firecracker v{}\n", FIRECRACKER_VERSION);
-                    process::exit(i32::from(vmm::FC_EXIT_CODE_OK));
-                }
+            if arg_parser.arguments().flag_present("version") {
+                println!("Firecracker v{}\n", FIRECRACKER_VERSION);
+                print_supported_snapshot_versions();
+                process::exit(i32::from(vmm::FC_EXIT_CODE_OK));
             }
 
             arg_parser.arguments()
@@ -168,7 +171,7 @@ fn main() {
     };
 
     // It's safe to unwrap here because the field's been provided with a default value.
-    let instance_id = arguments.value_as_string("id").unwrap();
+    let instance_id = arguments.single_value("id").unwrap();
     validate_instance_id(instance_id.as_str()).expect("Invalid instance ID");
 
     let instance_info = InstanceInfo {
@@ -178,17 +181,17 @@ fn main() {
         app_name: "Firecracker".to_string(),
     };
 
-    LOGGER.set_instance_id(instance_id);
+    LOGGER.set_instance_id(instance_id.to_owned());
 
-    if let Some(log) = arguments.value_as_string("log-path") {
+    if let Some(log) = arguments.single_value("log-path") {
         // It's safe to unwrap here because the field's been provided with a default value.
-        let level = arguments.value_as_string("level").unwrap();
+        let level = arguments.single_value("level").unwrap().to_owned();
         let logger_level = LoggerLevel::from_string(level).unwrap_or_else(|err| {
             error!("Invalid value for logger level: {}. Possible values: [Error, Warning, Info, Debug]", err);
             process::exit(i32::from(vmm::FC_EXIT_CODE_GENERIC_ERROR));
         });
-        let show_level = arguments.value_as_bool("show-level").unwrap_or(false);
-        let show_log_origin = arguments.value_as_bool("show-log-origin").unwrap_or(false);
+        let show_level = arguments.flag_present("show-level");
+        let show_log_origin = arguments.flag_present("show-log-origin");
 
         let logger_config = LoggerConfig::new(
             PathBuf::from(log),
@@ -203,9 +206,9 @@ fn main() {
     }
 
     // It's safe to unwrap here because the field's been provided with a default value.
-    let seccomp_level = arguments.value_as_string("seccomp-level").unwrap();
+    let seccomp_level = arguments.single_value("seccomp-level").unwrap();
     let seccomp_filter = get_seccomp_filter(
-        SeccompLevel::from_string(seccomp_level).unwrap_or_else(|err| {
+        SeccompLevel::from_string(&seccomp_level).unwrap_or_else(|err| {
             panic!("Invalid value for seccomp-level: {}", err);
         }),
     )
@@ -214,25 +217,25 @@ fn main() {
     });
 
     let vmm_config_json = arguments
-        .value_as_string("config-file")
+        .single_value("config-file")
         .map(fs::read_to_string)
         .map(|x| x.expect("Unable to open or read from the configuration file"));
 
-    let boot_timer_enabled = arguments.value_as_bool("boot-timer").unwrap_or(false);
-    let api_enabled = !arguments.value_as_bool("no-api").unwrap_or(false);
+    let boot_timer_enabled = arguments.flag_present("boot-timer");
+    let api_enabled = !arguments.flag_present("no-api");
 
     if api_enabled {
         let bind_path = arguments
-            .value_as_string("api-sock")
+            .single_value("api-sock")
             .map(PathBuf::from)
             .expect("Missing argument: api-sock");
 
-        let start_time_us = arguments.value_as_string("start-time-us").map(|s| {
+        let start_time_us = arguments.single_value("start-time-us").map(|s| {
             s.parse::<u64>()
                 .expect("'start-time-us' parameter expected to be of 'u64' type.")
         });
 
-        let start_time_cpu_us = arguments.value_as_string("start-time-cpu-us").map(|s| {
+        let start_time_cpu_us = arguments.single_value("start-time-cpu-us").map(|s| {
             s.parse::<u64>()
                 .expect("'start-time-cpu-us' parameter expected to be of 'u64' type.")
         });
@@ -253,6 +256,22 @@ fn main() {
             boot_timer_enabled,
         );
     }
+}
+
+// Print supported snapshot data format versions.
+fn print_supported_snapshot_versions() {
+    let mut snapshot_versions_str = "Supported snapshot data format versions:".to_string();
+    let mut snapshot_versions: Vec<String> = FC_VERSION_TO_SNAP_VERSION
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    snapshot_versions.sort();
+
+    snapshot_versions
+        .iter()
+        .for_each(|v| snapshot_versions_str.push_str(format!(" v{},", v).as_str()));
+    snapshot_versions_str.pop();
+    println!("{}\n", snapshot_versions_str);
 }
 
 // Configure and start a microVM as described by the command-line JSON.

@@ -13,10 +13,14 @@ use std::{fmt, io};
 use arch::aarch64::DeviceInfoForFDT;
 use arch::DeviceType;
 use devices::pseudo::BootTimer;
-use devices::virtio::VirtioDevice;
-use devices::{virtio::MmioTransport, BusDevice};
+use devices::virtio::{
+    Balloon, Block, MmioTransport, Net, VirtioDevice, TYPE_BALLOON, TYPE_BLOCK, TYPE_NET,
+    TYPE_VSOCK,
+};
+use devices::BusDevice;
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
+use logger::info;
 #[cfg(target_arch = "aarch64")]
 use utils::eventfd::EventFd;
 use versionize::{VersionMap, Versionize, VersionizeResult};
@@ -77,6 +81,7 @@ const MMIO_LEN: u64 = 0x1000;
 
 /// Stores the address range and irq allocated to this device.
 #[derive(Clone, Debug, PartialEq, Versionize)]
+// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct MMIODeviceInfo {
     /// Mmio address at which the device is registered.
     pub addr: u64,
@@ -172,6 +177,7 @@ impl MMIODeviceManager {
         self.irqs.check(&slot.irqs)
     }
 
+    /// Register a device at some MMIO address.
     fn register_mmio_device(
         &mut self,
         identifier: (DeviceType, String),
@@ -186,7 +192,7 @@ impl MMIODeviceManager {
     }
 
     /// Register a virtio-over-MMIO device to be used via MMIO transport at a specific slot.
-    pub fn register_virtio_mmio_device(
+    pub fn register_mmio_virtio(
         &mut self,
         vm: &VmFd,
         device_id: String,
@@ -236,7 +242,7 @@ impl MMIODeviceManager {
 
     /// Allocate slot and register an already created virtio-over-MMIO device. Also Adds the device
     /// to the boot cmdline.
-    pub fn register_new_virtio_mmio_device(
+    pub fn register_mmio_virtio_for_boot(
         &mut self,
         vm: &VmFd,
         device_id: String,
@@ -244,7 +250,7 @@ impl MMIODeviceManager {
         _cmdline: &mut kernel_cmdline::Cmdline,
     ) -> Result<MMIODeviceInfo> {
         let mmio_slot = self.allocate_new_slot(1)?;
-        self.register_virtio_mmio_device(vm, device_id, mmio_device, &mmio_slot)?;
+        self.register_mmio_virtio(vm, device_id, mmio_device, &mmio_slot)?;
         #[cfg(target_arch = "x86_64")]
         Self::add_virtio_device_to_cmdline(_cmdline, &mmio_slot)?;
         Ok(mmio_slot)
@@ -294,9 +300,9 @@ impl MMIODeviceManager {
         self.register_mmio_device(identifier, slot, Arc::new(Mutex::new(device)))
     }
 
-    /// Create and register a boot timer device.
-    pub fn register_new_mmio_boot_timer(&mut self, device: BootTimer) -> Result<()> {
-        // Create and attach a new boot timer device.
+    /// Register a boot timer device.
+    pub fn register_mmio_boot_timer(&mut self, device: BootTimer) -> Result<()> {
+        // Attach a new boot timer device.
         let slot = self.allocate_new_slot(0)?;
 
         let identifier = (DeviceType::BootTimer, DeviceType::BootTimer.to_string());
@@ -306,6 +312,17 @@ impl MMIODeviceManager {
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Gets the number of interrupts used by the devices registered.
+    pub fn used_irqs_count(&self) -> usize {
+        let mut irq_number = 0;
+        let _: Result<()> = self.for_each_device(|_, _, device_info, _| {
+            irq_number += device_info.irqs.len();
+            Ok(())
+        });
+        irq_number
     }
 
     /// Gets the the specified device.
@@ -325,7 +342,6 @@ impl MMIODeviceManager {
         None
     }
 
-    #[cfg(target_arch = "x86_64")]
     /// Run fn for each registered device.
     pub fn for_each_device<F, E>(&self, mut f: F) -> std::result::Result<(), E>
     where
@@ -371,6 +387,62 @@ impl MMIODeviceManager {
         }
         Ok(())
     }
+
+    /// Artificially kick devices as if they had external events.
+    pub fn kick_devices(&self) {
+        info!("Artificially kick devices.");
+        let _: Result<()> = self.for_each_device(|devtype, id, _, bus_dev| {
+            // We only kick virtio devices for now.
+            if let DeviceType::Virtio(virtio_type) = *devtype {
+                let bus_dev = bus_dev.lock().expect("Poisoned lock");
+                // Virtio devices are guaranteed MmioTransport.
+                let mmio_dev = bus_dev.as_any().downcast_ref::<MmioTransport>().unwrap();
+                let mut virtio = mmio_dev.locked_device();
+                match virtio_type {
+                    TYPE_BALLOON => {
+                        info!("kick balloon {}.", id);
+                        let balloon = virtio.as_mut_any().downcast_mut::<Balloon>().unwrap();
+                        // If device is activated, kick the balloon queue(s) to make up for any
+                        // pending or in-flight epoll events we may have not captured in snapshot.
+                        // Stats queue doesn't need kicking as it is notified via a `timer_fd`.
+                        if balloon.is_activated() {
+                            balloon.process_virtio_queues();
+                        }
+                    }
+                    TYPE_BLOCK => {
+                        info!("kick block {}.", id);
+                        let block = virtio.as_mut_any().downcast_mut::<Block>().unwrap();
+                        // If device is activated, kick the block queue(s) to make up for any
+                        // pending or in-flight epoll events we may have not captured in snapshot.
+                        // No need to kick Ratelimiters because they are restored 'unblocked' so
+                        // any inflight `timer_fd` events can be safely discarded.
+                        if block.is_activated() {
+                            block.process_virtio_queues();
+                        }
+                    }
+                    TYPE_NET => {
+                        info!("kick net {}.", id);
+                        let net = virtio.as_mut_any().downcast_mut::<Net>().unwrap();
+                        // If device is activated, kick the net queue(s) to make up for any
+                        // pending or in-flight epoll events we may have not captured in snapshot.
+                        // No need to kick Ratelimiters because they are restored 'unblocked' so
+                        // any inflight `timer_fd` events can be safely discarded.
+                        if net.is_activated() {
+                            net.process_virtio_queues();
+                        }
+                    }
+                    TYPE_VSOCK => {
+                        // Vsock has complicated protocol that isn't resilient to any packet loss,
+                        // so for Vsock we don't support connection persistence through snapshot.
+                        // Any in-flight packets or events are simply lost.
+                        // Vsock is restored 'empty'.
+                    }
+                    _ => (),
+                }
+            };
+            Ok(())
+        });
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -410,7 +482,7 @@ mod tests {
         ) -> Result<u64> {
             let mmio_device = MmioTransport::new(guest_mem, device);
             let mmio_slot =
-                self.register_new_virtio_mmio_device(vm, dev_id.to_string(), mmio_device, cmdline)?;
+                self.register_mmio_virtio_for_boot(vm, dev_id.to_string(), mmio_device, cmdline)?;
             Ok(mmio_slot.addr)
         }
     }
@@ -662,6 +734,7 @@ mod tests {
                 Ok(())
             });
             assert_eq!(count, 3);
+            assert_eq!(device_manager.used_irqs_count(), 2);
         }
     }
 
