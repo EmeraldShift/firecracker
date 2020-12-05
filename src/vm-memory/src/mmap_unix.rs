@@ -165,12 +165,22 @@ impl MmapRegion {
             (-1, 0)
         };
 
+        let final_flags = if policy == GuestPagingPolicy::ExplicitHugepages {
+            flags | libc::MAP_HUGETLB
+        } else {
+            flags
+        };
+
         // This is safe because we're not allowing MAP_FIXED, and invalid parameters cannot break
         // Rust safety guarantees (things may change if we're mapping /dev/mem or some wacky file).
-        let addr = unsafe { libc::mmap(null_mut(), size, prot, flags, fd, offset as libc::off_t) };
+        let addr = unsafe { libc::mmap(null_mut(), size, prot, final_flags, fd, offset as libc::off_t) };
 
         if addr == libc::MAP_FAILED {
             return Err(Error::Mmap(io::Error::last_os_error()));
+        }
+
+        if policy == GuestPagingPolicy::TransparentHugepages {
+                unsafe { libc::madvise(addr, size, libc::MADV_HUGEPAGE); }
         }
 
         Ok(Self {

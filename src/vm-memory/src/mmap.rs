@@ -38,7 +38,7 @@ pub use crate::mmap_unix::{Error as MmapRegionError, MmapRegion};
 static MAX_ACCESS_CHUNK: usize = 4096;
 
 /// Page configuration types for controlling allocation size and behavior
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum GuestPagingPolicy {
     /// Base pages are the smallest page-size unit available on the system.
     BasePages,
