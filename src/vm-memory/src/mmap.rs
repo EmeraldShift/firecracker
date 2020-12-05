@@ -512,7 +512,12 @@ impl GuestMemoryMmap {
         guest_base: GuestAddress,
         size: usize,
     ) -> GuestPagingPolicy {
-        default_policy
+        // If the base or the size is not aligned, default to base pages
+        if guest_base.unchecked_align_up(0x200000) != guest_base {
+            GuestPagingPolicy::BasePages
+        } else {
+            default_policy
+        }
     }
 
     /// Insert a region into the `GuestMemoryMmap` object and return a new `GuestMemoryMmap`.
