@@ -32,4 +32,4 @@ else
 fi
 
 
-sudo build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker --no-api --config-file hello-config.json
+echo -e "\n" | sudo build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker --no-api --config-file hello-config.json
