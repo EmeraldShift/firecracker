@@ -32,7 +32,7 @@ use vmm_sys_util::errno;
 
 use crate::bitmap::Bitmap;
 
-pub use crate::mmap_unix::{MmapRegion, Error as MmapRegionError};
+pub use crate::mmap_unix::{Error as MmapRegionError, MmapRegion};
 
 // The maximum number of bytes that can be read/written at a time.
 static MAX_ACCESS_CHUNK: usize = 4096;
@@ -390,7 +390,11 @@ impl GuestMemoryMmap {
     ///
     /// Valid memory regions are specified as a slice of (Address, Size) tuples sorted by Address.
     pub fn from_ranges(ranges: &[(GuestAddress, usize)]) -> result::Result<Self, Error> {
-        Self::from_ranges_with_files(ranges.iter().map(|r| (r.0, r.1, None)), false, GuestPagingPolicy::BasePages)
+        Self::from_ranges_with_files(
+            ranges.iter().map(|r| (r.0, r.1, None)),
+            false,
+            GuestPagingPolicy::BasePages,
+        )
     }
 
     /// Creates a container, allocates anonymous memory for guest memory regions and enables dirty
@@ -400,7 +404,11 @@ impl GuestMemoryMmap {
     pub fn from_ranges_with_tracking(
         ranges: &[(GuestAddress, usize)],
     ) -> result::Result<Self, Error> {
-        Self::from_ranges_with_files(ranges.iter().map(|r| (r.0, r.1, None)), true, GuestPagingPolicy::BasePages)
+        Self::from_ranges_with_files(
+            ranges.iter().map(|r| (r.0, r.1, None)),
+            true,
+            GuestPagingPolicy::BasePages,
+        )
     }
 
     pub fn from_ranges_with_policy(
@@ -499,7 +507,11 @@ impl GuestMemoryMmap {
         Ok(Self { regions })
     }
 
-    fn pick_paging_policy(default_policy: GuestPagingPolicy, guest_base: GuestAddress, size: usize) -> GuestPagingPolicy {
+    fn pick_paging_policy(
+        default_policy: GuestPagingPolicy,
+        guest_base: GuestAddress,
+        size: usize,
+    ) -> GuestPagingPolicy {
         default_policy
     }
 

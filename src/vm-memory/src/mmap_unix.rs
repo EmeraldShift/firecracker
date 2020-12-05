@@ -17,8 +17,8 @@ use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
 use std::result;
 
+use crate::mmap::{check_file_offset, AsSlice, GuestPagingPolicy};
 use vm_memory_upstream::guest_memory::FileOffset;
-use crate::mmap::{AsSlice, GuestPagingPolicy, check_file_offset};
 use vm_memory_upstream::volatile_memory::{self, compute_offset, VolatileMemory, VolatileSlice};
 
 /// Error conditions that may arise when creating a new `MmapRegion` object.
@@ -121,7 +121,11 @@ impl MmapRegion {
     /// * `file_offset` - The mapping will be created at offset `file_offset.start` in the file
     ///                   referred to by `file_offset.file`.
     /// * `size` - The size of the memory region in bytes.
-    pub fn from_file(file_offset: FileOffset, size: usize, policy: GuestPagingPolicy) -> Result<Self> {
+    pub fn from_file(
+        file_offset: FileOffset,
+        size: usize,
+        policy: GuestPagingPolicy,
+    ) -> Result<Self> {
         Self::build(
             Some(file_offset),
             size,

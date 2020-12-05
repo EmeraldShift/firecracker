@@ -185,7 +185,7 @@ impl SnapshotMemory for GuestMemoryMmap {
                 region.size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_NORESERVE | libc::MAP_PRIVATE,
-                GuestPagingPolicy::BasePages
+                GuestPagingPolicy::BasePages,
             )
             .map(|r| {
                 let mut region = GuestRegionMmap::new(r, GuestAddress(region.base_address))?;
