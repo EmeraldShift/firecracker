@@ -32,14 +32,68 @@ use vmm_sys_util::errno;
 
 use crate::bitmap::Bitmap;
 
-pub use vm_memory_upstream::mmap::{MmapRegion, MmapRegionError};
-
-// Here are some things that originate in this module, and we can continue to use the upstream
-// definitions/implementations.
-pub use vm_memory_upstream::mmap::{check_file_offset, Error};
+pub use crate::mmap_unix::{MmapRegion, Error as MmapRegionError};
 
 // The maximum number of bytes that can be read/written at a time.
 static MAX_ACCESS_CHUNK: usize = 4096;
+
+/// Page configuration types for controlling allocation size and behavior
+#[derive(Debug, Copy, Clone)]
+pub enum GuestPagingPolicy {
+    /// Base pages are the smallest page-size unit available on the system.
+    BasePages,
+    /// Transparent hugepages, if available, are managed by the host operating system.
+    TransparentHugepages,
+    /// Explicit hugepages swear a lot. Especially if the addresses aren't aligned.
+    ExplicitHugepages,
+}
+
+/// Errors that can occur when creating a memory map.
+#[derive(Debug)]
+pub enum Error {
+    /// Adding the guest base address to the length of the underlying mapping resulted
+    /// in an overflow.
+    InvalidGuestRegion,
+    /// Error creating a `MmapRegion` object.
+    MmapRegion(MmapRegionError),
+    /// No memory region found.
+    NoMemoryRegion,
+    /// Some of the memory regions intersect with each other.
+    MemoryRegionOverlap,
+    /// The provided memory regions haven't been sorted.
+    UnsortedMemoryRegions,
+}
+
+pub trait AsSlice {
+    unsafe fn as_slice(&self) -> &[u8];
+    unsafe fn as_mut_slice(&self) -> &mut [u8];
+}
+
+// TODO: use this for Windows as well after we redefine the Error type there.
+#[cfg(unix)]
+/// Checks if a mapping of `size` bytes fits at the provided `file_offset`.
+///
+/// For a borrowed `FileOffset` and size, this function checks whether the mapping does not
+/// extend past EOF, and that adding the size to the file offset does not lead to overflow.
+pub fn check_file_offset(
+    file_offset: &FileOffset,
+    size: usize,
+) -> result::Result<(), MmapRegionError> {
+    let file = file_offset.file();
+    let start = file_offset.start();
+
+    if let Some(end) = start.checked_add(size as u64) {
+        if let Ok(metadata) = file.metadata() {
+            if metadata.len() < end {
+                return Err(MmapRegionError::MappingPastEof);
+            }
+        }
+    } else {
+        return Err(MmapRegionError::InvalidOffsetLength);
+    }
+
+    Ok(())
+}
 
 /// [`GuestMemoryRegion`](trait.GuestMemoryRegion.html) implementation that mmaps the guest's
 /// memory region in the current process.
@@ -336,7 +390,7 @@ impl GuestMemoryMmap {
     ///
     /// Valid memory regions are specified as a slice of (Address, Size) tuples sorted by Address.
     pub fn from_ranges(ranges: &[(GuestAddress, usize)]) -> result::Result<Self, Error> {
-        Self::from_ranges_with_files(ranges.iter().map(|r| (r.0, r.1, None)), false)
+        Self::from_ranges_with_files(ranges.iter().map(|r| (r.0, r.1, None)), false, GuestPagingPolicy::BasePages)
     }
 
     /// Creates a container, allocates anonymous memory for guest memory regions and enables dirty
@@ -346,7 +400,14 @@ impl GuestMemoryMmap {
     pub fn from_ranges_with_tracking(
         ranges: &[(GuestAddress, usize)],
     ) -> result::Result<Self, Error> {
-        Self::from_ranges_with_files(ranges.iter().map(|r| (r.0, r.1, None)), true)
+        Self::from_ranges_with_files(ranges.iter().map(|r| (r.0, r.1, None)), true, GuestPagingPolicy::BasePages)
+    }
+
+    pub fn from_ranges_with_policy(
+        ranges: &[(GuestAddress, usize)],
+        policy: GuestPagingPolicy,
+    ) -> result::Result<Self, Error> {
+        Self::from_ranges_with_files(ranges.iter().map(|r| (r.0, r.1, None)), false, policy)
     }
 
     /// Creates a container and allocates anonymous memory for guest memory regions.
@@ -361,6 +422,7 @@ impl GuestMemoryMmap {
     pub fn from_ranges_with_files<A, T>(
         ranges: T,
         track_dirty_pages: bool,
+        default_policy: GuestPagingPolicy,
     ) -> result::Result<Self, Error>
     where
         A: Borrow<(GuestAddress, usize, Option<FileOffset>)>,
@@ -373,10 +435,12 @@ impl GuestMemoryMmap {
                     let guest_base = x.borrow().0;
                     let size = x.borrow().1;
 
+                    let policy = Self::pick_paging_policy(default_policy, guest_base, size);
+
                     if let Some(ref f_off) = x.borrow().2 {
-                        MmapRegion::from_file(f_off.clone(), size)
+                        MmapRegion::from_file(f_off.clone(), size, policy)
                     } else {
-                        MmapRegion::new(size)
+                        MmapRegion::new(size, policy)
                     }
                     .map_err(Error::MmapRegion)
                     .and_then(|r| {
@@ -433,6 +497,10 @@ impl GuestMemoryMmap {
         }
 
         Ok(Self { regions })
+    }
+
+    fn pick_paging_policy(default_policy: GuestPagingPolicy, guest_base: GuestAddress, size: usize) -> GuestPagingPolicy {
+        default_policy
     }
 
     /// Insert a region into the `GuestMemoryMmap` object and return a new `GuestMemoryMmap`.

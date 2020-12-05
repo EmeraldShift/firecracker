@@ -11,12 +11,16 @@
 //! upstream implementation and adds dirty page tracking functionality.
 pub mod bitmap;
 pub mod mmap;
+pub mod mmap_unix;
 
 // Export local backend implementation.
-pub use mmap::{GuestMemoryMmap, GuestRegionMmap};
+pub use mmap::{Error, GuestMemoryMmap, GuestPagingPolicy, GuestRegionMmap};
+
+pub use mmap_unix::MmapRegion;
 
 // Re-export only what is needed in Firecracker.
 pub use vm_memory_upstream::{
-    address, Address, ByteValued, Bytes, Error, FileOffset, GuestAddress, GuestMemory,
-    GuestMemoryError, GuestMemoryRegion, MemoryRegionAddress, MmapRegion,
+    address, Address, ByteValued, Bytes, FileOffset, GuestAddress, GuestMemory,
+    GuestMemoryError, GuestMemoryRegion, MemoryRegionAddress,
 };
+
