@@ -5,3 +5,5 @@ target
 .idea
 __pycache__
 *.pyc
+*.ext4
+*.bin
