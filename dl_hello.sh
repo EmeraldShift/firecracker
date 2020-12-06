@@ -1,4 +1,5 @@
-#!/usr/bin/env sh
+#!/bin/sh
+set -e
 
 arch=`uname -m`
 dest_kernel="hello-vmlinux.bin"
@@ -30,6 +31,3 @@ if [ ! -f ${dest_rootfs} ]; then
 else
 	echo "Already downloaded."
 fi
-
-
-echo -e "\n" | sudo build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker --no-api --config-file hello-config.json
