@@ -1,0 +1,53 @@
+#!/bin/bash
+set -e
+
+function usage {
+	echo "usage: run <run|time|interactive> <image> <mem_size_mib>"
+	exit
+}
+
+[[ $# -ne 3 ]] && usage
+[[ $1 == "run" || $1 == "time" || $1 == "interactive" ]] || usage
+
+FC=build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker
+
+# Runs a single instance of Firecracker with the given image and memory size
+function run_firecracker {
+	# Generate configuration file from template
+	CONFIG=$(mktemp)
+	trap "rm -f $CONFIG" 0 2 3 15
+	IMAGE=$2 MEMSZ=$3 envsubst < config.json > "$CONFIG"
+
+	# Piping input into firecracker stops it from attaching stdin to the serial in
+	[[ $1 == "noint" ]] && echo -e "\n" | sudo ${FC} --no-api --config-file "${CONFIG}"
+
+	# Otherwise, we can interact with the microvm
+	[[ $1 == "int" ]] && sudo ${FC} --no-api --config-file "${CONFIG}"
+}
+
+# Forces a Firecracker run, terminating it when the "Welcome" message appears, and printing the runtime
+function get_time_to_welcome {
+	export TIMEFORMAT=%R
+	(time cat) | \
+		# Look for welcome message
+		grep --line-buffered --color=never "Welcome" | \
+		# Kill the upstream job, which lets `time` return
+		(read -n 1 && kill -s TERM `pidof firecracker`)
+}
+
+# Runs the image
+function run {
+	run_firecracker noint $1 $2
+}
+
+# Runs the image and tracks the time-to-welcome
+function time {
+	(run_firecracker noint $1 $2 | get_time_to_welcome 2>&1) 2>/dev/null
+}
+
+# Runs the image, with serial input enabled
+function interactive {
+	run_firecracker int $1 $2
+}
+
+$@

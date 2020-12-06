@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+[[ $# -lt 2 ]] && { echo "usage: bench policy config1 [config2] ..."; exit; }
+
+POLICY=$1
+
+function run_benchmark {
+	CONFIG=$1
+	source ${CONFIG} # Read environment vars from config file (e.g. image, memsz)
+
+	# Validate arguments
+	[[ -z "${IMAGE}" ]] && { echo "Undefined variable 'IMAGE'"; exit; }
+	[[ -z "${MEMSZS}" ]] && { echo "Undefined variable 'MEMSZS'"; exit; }
+
+	base=$(basename -- ${CONFIG})
+	RUN="${base%.*}"
+
+	echo "Starting benchmark ${RUN}"
+	mkdir -p "out/${RUN}"
+	for memsz in ${MEMSZS}; do
+		relpath="${RUN}/${POLICY}-${memsz}"
+		out="out/${relpath}"
+		echo "${relpath} ... "
+		echo >${out}
+		# Run each benchmark 5 times
+		for i in {1..5}; do
+			echo -ne "\t"
+			(timeout 10 sh/run time "${IMAGE}" ${memsz} || echo "fail") | tee -a "${out}"
+		done
+	done
+	echo "Finished benchmark ${RUN}"
+}
+
+for benchmark in ${@:2}; do run_benchmark ${benchmark}; done

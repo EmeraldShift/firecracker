@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+
+grep -nr fail out | cut -d: -f1 | xargs echo | tee /dev/stderr | xargs rm -f
